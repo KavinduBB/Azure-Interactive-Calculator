@@ -13,6 +13,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $redirects = $Origins | ForEach-Object { "$($_.TrimEnd('/'))/auth/redirect" }
+# Where a customer's admin lands after approving the app for their whole organization.
+$consentRedirects = $Origins | ForEach-Object { "$($_.TrimEnd('/'))/auth/admin-consent" }
 
 # Azure Service Management API and its delegated user_impersonation permission.
 $armApi = "797f4846-ba00-4fd7-ba43-dac1f8f63013"
@@ -23,9 +25,10 @@ $app = az ad app create `
   --sign-in-audience AzureADMultipleOrgs `
   --query "{appId:appId, id:id}" -o json | ConvertFrom-Json
 
-$spa = @{ spa = @{ redirectUris = $redirects } } | ConvertTo-Json -Depth 5 -Compress
+$spa = @{ spa = @{ redirectUris = $redirects }; web = @{ redirectUris = $consentRedirects } } | ConvertTo-Json -Depth 5 -Compress
 $spaFile = New-TemporaryFile
-Set-Content -Path $spaFile -Value $spa -Encoding utf8
+# Write without a byte-order mark; Windows PowerShell's utf8 encoding adds one, which Graph rejects.
+[System.IO.File]::WriteAllText($spaFile.FullName, $spa, (New-Object System.Text.UTF8Encoding $false))
 az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$($app.id)" --headers "Content-Type=application/json" --body "@$spaFile" | Out-Null
 Remove-Item $spaFile
 

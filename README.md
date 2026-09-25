@@ -28,9 +28,16 @@ Pricing rules live in `src/lib/pricing/rules.ts`, one function per resource type
 
 Priced today: virtual machines and scale sets (Windows and Linux, Azure Hybrid Benefit, deallocated), managed disks, public IPs, private endpoints, private DNS zones, App Service plans, Static Web Apps, SQL Database (DTU and vCore, including the SQL licence meter), PostgreSQL and MySQL flexible servers, container registries, storage accounts (from used capacity).
 
+## Two ways to connect
+
+- **Live subscription** (`/live`): sign in with a Microsoft account. This is what other people use.
+- **This PC (Azure CLI)** (`/local`): uses the `az login` session on the machine running the app. Only works locally (the server refuses it in production unless `AZURE_AUTH_MODE=cli`), and the tab is hidden in production builds.
+
+Each tab remembers its own subscription and resource group choices.
+
 ## Letting other people connect their Azure
 
-Local development uses your `az login`. For anyone else, turn on Microsoft sign-in:
+For anyone other than you, turn on Microsoft sign-in:
 
 1. Create the app registration (multi-tenant SPA, delegated `Azure Service Management / user_impersonation`):
    ```powershell
@@ -40,6 +47,19 @@ Local development uses your `az login`. For anyone else, turn on Microsoft sign-
 3. Deploy with `AZURE_AUTH_MODE` unset or `bearer`. **Never set `AZURE_AUTH_MODE=cli` on a public deployment**: it would let visitors read the host's Azure account.
 
 Users sign in with a popup; the browser gets an ARM token and sends it to the API routes, which call Azure on the user's behalf. Nothing is stored on the server.
+
+### "Approval required" and making it public
+
+Whether a user can approve the app themselves is set by **their** organization, not by this app:
+
+- Organizations that let users consent: users approve on first sign-in.
+- Organizations that don't (common, and the case for many companies): the sign-in page shows an **admin approval link**. An admin opens it once, approves the app for the whole directory, and lands on `/auth/admin-consent`. After that everyone there can sign in and sees only what their own Azure role allows.
+
+To make approval smoother for the public:
+
+1. **Verify the publisher** so the consent screen stops saying "unverified": join the free Microsoft AI Cloud Partner Program, add a verified domain to the app registration, then run publisher verification (Entra ID → App registrations → Branding & properties).
+2. **Deploy to a real domain** and add `https://your-domain/auth/redirect` (SPA) and `https://your-domain/auth/admin-consent` (Web) to the app registration, or re-run the script with that origin.
+3. Add a privacy statement and terms of service URL to the app registration; admins look for these before approving.
 
 ## Project layout
 

@@ -1,6 +1,6 @@
 import "server-only";
 import { armFetch, armList } from "./arm";
-import type { AzureResource, Subscription } from "../types";
+import type { AzureResource, Subscription, Tenant } from "../types";
 
 interface GraphResponse {
   data: Record<string, unknown>[];
@@ -44,6 +44,14 @@ export async function listSubscriptions(token: string): Promise<Subscription[]> 
       tenantId: s.tenantId,
       quotaId: s.subscriptionPolicies?.quotaId,
     }))
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+/** Directories the signed-in account can access. Works with a token from any of them. */
+export async function listTenants(token: string): Promise<Tenant[]> {
+  const rows = await armList<{ tenantId: string; displayName?: string; defaultDomain?: string }>(token, "/tenants?api-version=2022-12-01");
+  return rows
+    .map((t) => ({ tenantId: t.tenantId, displayName: t.displayName || t.defaultDomain || t.tenantId, defaultDomain: t.defaultDomain }))
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 

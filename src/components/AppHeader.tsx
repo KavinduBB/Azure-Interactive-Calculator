@@ -1,7 +1,10 @@
 import Link from "next/link";
 import { Layers } from "lucide-react";
 
-export function AppHeader({ active, right }: { active: "estimate" | "live" | "home"; right?: React.ReactNode }) {
+// The Azure CLI tab only works when the app runs on your own computer, so it's hidden in production builds.
+const showLocalTab = process.env.NODE_ENV !== "production" || process.env.NEXT_PUBLIC_SHOW_LOCAL_CLI === "true";
+
+export function AppHeader({ active, right }: { active: "estimate" | "live" | "local" | "home"; right?: React.ReactNode }) {
   const tab = (href: string, key: string, label: string) => (
     <Link
       href={href}
@@ -24,6 +27,7 @@ export function AppHeader({ active, right }: { active: "estimate" | "live" | "ho
       <nav className="flex items-center gap-1" aria-label="Main">
         {tab("/estimate", "estimate", "Estimate")}
         {tab("/live", "live", "Live subscription")}
+        {showLocalTab && tab("/local", "local", "This PC (Azure CLI)")}
       </nav>
       <div className="ml-auto flex items-center gap-3">{right}</div>
     </header>

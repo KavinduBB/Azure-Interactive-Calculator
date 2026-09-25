@@ -20,6 +20,9 @@ export function cliModeEnabled(): boolean {
   return process.env.NODE_ENV !== "production";
 }
 
+/** Header the "This PC" view sends to ask for the local Azure CLI session. */
+export const AUTH_SOURCE_HEADER = "x-auth-source";
+
 let cliCredential: AzureCliCredential | null = null;
 
 export async function getArmToken(req: Request): Promise<{ token: string; mode: AuthMode }> {
@@ -27,8 +30,14 @@ export async function getArmToken(req: Request): Promise<{ token: string; mode: 
   if (header?.toLowerCase().startsWith("bearer ")) {
     return { token: header.slice(7).trim(), mode: "bearer" };
   }
-  if (!cliModeEnabled()) {
+  // With Microsoft sign-in configured, the CLI session is used only when a request asks for it,
+  // so the sign-in view never silently falls back to the host's account.
+  const wantsCli = req.headers.get(AUTH_SOURCE_HEADER) === "cli" || !process.env.NEXT_PUBLIC_ENTRA_CLIENT_ID;
+  if (!wantsCli) {
     throw new AuthError("Sign in with Microsoft to read your Azure resources.");
+  }
+  if (!cliModeEnabled()) {
+    throw new AuthError("The Azure CLI connection is only available when the app runs on your own computer.");
   }
   cliCredential ??= new AzureCliCredential();
   try {

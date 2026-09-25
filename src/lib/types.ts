@@ -58,6 +58,12 @@ export interface Subscription {
   quotaId?: string;
 }
 
+export interface Tenant {
+  tenantId: string;
+  displayName: string;
+  defaultDomain?: string;
+}
+
 export interface RetailPrice {
   currencyCode: string;
   retailPrice: number;

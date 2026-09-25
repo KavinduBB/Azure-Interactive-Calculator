@@ -21,13 +21,13 @@ import { CategoryIcon } from "@/components/CategoryIcon";
 import { StatusPill } from "@/components/StatusPill";
 import { ResourceNode, type ResourceNodeData } from "@/components/diagram/ResourceNode";
 import { GroupNode } from "@/components/diagram/GroupNode";
-import { api, downloadCsv, readLocal, setTokenProvider, writeLocal } from "@/lib/api";
-import { armToken, currentAccount, msalEnabled, signIn, signOut } from "@/lib/msal";
+import { api, downloadCsv, readLocal, setAuthSource, setTokenProvider, writeLocal } from "@/lib/api";
+import { adminConsentUrl, armToken, currentAccount, msalEnabled, signIn, signOut } from "@/lib/msal";
 import { layoutGraph } from "@/lib/graph";
 import { portalUrl, typeInfo } from "@/lib/catalog";
 import { money, timeAgo } from "@/lib/format";
 import { whatIfOptions } from "@/lib/whatif";
-import { CURRENCIES, type AzureResource, type CostResult, type Currency, type ResourceEstimate, type Subscription } from "@/lib/types";
+import { CURRENCIES, type Tenant, type AzureResource, type CostResult, type Currency, type ResourceEstimate, type Subscription } from "@/lib/types";
 
 interface Snapshot {
   fetchedAt: string;
@@ -77,23 +77,29 @@ interface Prefs {
   currency: Currency;
   hideMinor: boolean;
   refreshSec: number;
+  tenant?: string | null;
 }
 
 /** What a resource contributes to the monthly estimate: its priced lines, including the fixed part of usage-based ones. */
 const monthlyOf = (e?: ResourceEstimate) => (e && (e.status === "priced" || e.status === "usage") ? e.monthly : 0);
 
-export default function LiveView() {
+/** Where Azure access comes from: a signed-in Microsoft account, or this computer's `az login`. */
+export type Source = "microsoft" | "cli";
+
+export default function LiveView({ source = "microsoft" }: { source?: Source }) {
   return (
     <ReactFlowProvider>
-      <LiveInner />
+      <LiveInner source={source} />
     </ReactFlowProvider>
   );
 }
 
-function LiveInner() {
+function LiveInner({ source }: { source: Source }) {
+  const prefsKey = `${PREFS}.${source}`;
+  const useMsal = source === "microsoft" && msalEnabled;
   const initial = useMemo(
-    () => readLocal<Prefs>(PREFS, { subs: [], rgs: [], currency: "USD", hideMinor: true, refreshSec: 0 }),
-    [],
+    () => readLocal<Prefs>(prefsKey, { subs: [], rgs: [], currency: "USD", hideMinor: true, refreshSec: 0 }),
+    [prefsKey],
   );
   const [status, setStatus] = useState<Status | null>(null);
   const [subs, setSubs] = useState<Subscription[]>([]);
@@ -111,23 +117,45 @@ function LiveInner() {
   const [whatIf, setWhatIf] = useState<Record<string, WhatIf>>({});
   const [, setClock] = useState(0);
   const [account, setAccount] = useState<string | null>(null);
+  const [signInFailed, setSignInFailed] = useState(false);
+  const [tenants, setTenants] = useState<Tenant[]>([]);
+  const [tenant, setTenant] = useState<string | null>(initial.tenant ?? null);
+  const tenantRef = useRef<string | null>(null);
+  const prefTenant = useRef<string | null>(initial.tenant ?? null);
   const lastCosts = useRef<{ at: number; costs: Snapshot["costs"]; currency: string } | null>(null);
   const snapRef = useRef<Snapshot | null>(null);
+  const scopeRef = useRef<string>("");
   const rf = useReactFlow();
   const router = useRouter();
 
   // Persist preferences.
   useEffect(() => {
-    writeLocal(PREFS, { subs: selSubs, rgs: selRgs, currency, hideMinor, refreshSec } satisfies Prefs);
-  }, [selSubs, selRgs, currency, hideMinor, refreshSec]);
+    writeLocal(prefsKey, { subs: selSubs, rgs: selRgs, currency, hideMinor, refreshSec, tenant } satisfies Prefs);
+  }, [prefsKey, selSubs, selRgs, currency, hideMinor, refreshSec, tenant]);
 
-  // Connection status and subscriptions. Uses the Microsoft account when signed in, otherwise local Azure CLI.
-  const connect = useCallback(async () => {
+  // Connection status and subscriptions, from the signed-in Microsoft account or this computer's Azure CLI.
+  const connect = useCallback(async (tenantOverride?: string) => {
     try {
-      if (msalEnabled) {
+      setAuthSource(source);
+      if (source === "cli") setTokenProvider(null);
+      if (useMsal) {
         const acct = await currentAccount();
-        setTokenProvider(acct ? armToken : null);
         setAccount(acct?.username ?? null);
+        if (acct) {
+          // List directories with a home-directory token, then switch to the chosen one.
+          tenantRef.current = null;
+          setTokenProvider(() => armToken(tenantRef.current));
+          const t = await api<{ tenants: Tenant[] }>("/api/azure/tenants");
+          const want = tenantOverride ?? prefTenant.current;
+          const chosen = t.tenants.find((x) => x.tenantId === want)?.tenantId ?? acct.tenantId ?? t.tenants[0]?.tenantId ?? null;
+          tenantRef.current = chosen;
+          prefTenant.current = chosen;
+          setTenants(t.tenants);
+          setTenant(chosen);
+        } else {
+          setTokenProvider(null);
+          setTenants([]);
+        }
       }
       const s = await api<Status>("/api/azure/status");
       setStatus(s);
@@ -141,7 +169,7 @@ function LiveInner() {
     } catch (e) {
       setError((e as Error).message);
     }
-  }, []);
+  }, [source, useMsal]);
 
   useEffect(() => {
     let alive = true;
@@ -156,7 +184,13 @@ function LiveInner() {
   const onSignIn = async () => {
     setError(null);
     try {
-      await signIn();
+      const acct = await signIn().catch(() => null);
+      if (!acct) {
+        // Cancelled, or blocked because the organization requires an admin to approve the app.
+        setSignInFailed(true);
+        return;
+      }
+      setSignInFailed(false);
       snapRef.current = null;
       lastCosts.current = null;
       setSnap(null);
@@ -169,10 +203,22 @@ function LiveInner() {
     await signOut().catch(() => undefined);
     setTokenProvider(null);
     setAccount(null);
+    setTenants([]);
     snapRef.current = null;
     setSnap(null);
     setSubs([]);
     await connect();
+  };
+  const onTenant = async (id: string) => {
+    setTenant(id);
+    snapRef.current = null;
+    lastCosts.current = null;
+    setSnap(null);
+    setSubs([]);
+    setSelSubs([]);
+    setRgs([]);
+    setSelRgs([]);
+    await connect(id);
   };
 
   // Resource groups for the chosen subscriptions.
@@ -202,11 +248,17 @@ function LiveInner() {
         });
         if (needCosts) lastCosts.current = { at: Date.now(), costs: next.costs, currency };
         else next.costs = cached!.costs;
+        // Only compare loads of the same selection. Switching subscription, resource group
+        // or directory isn't a change in Azure, so it starts a fresh feed.
+        const scope = [source, tenantRef.current ?? "", [...selSubs].sort().join(","), [...selRgs].sort().join(",")].join("|");
         const prev = snapRef.current;
-        if (prev && prev.currency === next.currency) {
+        if (prev && scopeRef.current === scope && prev.currency === next.currency) {
           const found = diff(prev, next);
           if (found.length) setChanges((c) => [...found, ...c].slice(0, 40));
+        } else if (scopeRef.current !== scope) {
+          setChanges([]);
         }
+        scopeRef.current = scope;
         snapRef.current = next;
         setSnap(next);
       } catch (e) {
@@ -215,7 +267,7 @@ function LiveInner() {
         setLoading(false);
       }
     },
-    [selSubs, selRgs, currency],
+    [selSubs, selRgs, currency, source],
   );
 
   // Auto-refresh.
@@ -349,7 +401,7 @@ function LiveInner() {
           {status.user ? ` · ${status.user}` : ""}
         </span>
       )}
-      {msalEnabled &&
+      {useMsal &&
         (account ? (
           <button type="button" onClick={onSignOut} className="text-[13px] text-ink-2 hover:text-ink hover:underline">Sign out</button>
         ) : (
@@ -362,13 +414,29 @@ function LiveInner() {
 
   return (
     <div className="flex h-screen flex-col">
-      <AppHeader active="live" right={statusChip} />
+      <AppHeader active={source === "cli" ? "local" : "live"} right={statusChip} />
 
       {status && !status.connected ? (
-        <NotConnected status={status} onSignIn={onSignIn} />
+        <NotConnected source={source} status={status} onSignIn={onSignIn} signInFailed={signInFailed} />
       ) : (
         <>
           <div className="flex flex-wrap items-end gap-3 border-b border-line bg-panel px-4 py-3">
+            {tenants.length > 0 && (
+              <label className="flex flex-col">
+                <span className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted">Directory</span>
+                <select
+                  value={tenant ?? ""}
+                  onChange={(e) => onTenant(e.target.value)}
+                  className="h-9 max-w-[240px] rounded-md border border-line bg-panel px-2 text-[13px]"
+                >
+                  {tenants.map((t) => (
+                    <option key={t.tenantId} value={t.tenantId}>
+                      {t.displayName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <MultiSelect label="Subscriptions" options={subOptions} value={selSubs} onChange={setSelSubs} placeholder="Choose subscriptions" />
             <MultiSelect label="Resource groups" options={rgOptions} value={selRgs} onChange={setSelRgs} placeholder="All" allLabel="All resource groups" />
             <label className="flex flex-col">
@@ -508,7 +576,66 @@ function diff(prev: Snapshot, next: Snapshot): Change[] {
   return out;
 }
 
-function NotConnected({ status, onSignIn }: { status: Status; onSignIn: () => void }) {
+function AdminApproval({ prominent }: { prominent: boolean }) {
+  const url = adminConsentUrl();
+  const [copied, setCopied] = useState(false);
+  if (!url) return null;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard blocked; the link is still visible to select */
+    }
+  };
+  return (
+    <div className={`mt-5 rounded-lg border p-4 text-[13px] ${prominent ? "border-warn/40 bg-warn-soft" : "border-line bg-panel-2"}`}>
+      <h2 className="font-semibold">{prominent ? "Your organization needs to approve this app" : "Seeing “Approval required”?"}</h2>
+      <p className="mt-1 text-ink-2">
+        Many organizations only let an admin approve apps. Send this link to your IT admin. They open it once, approve Azure Cost Canvas for everyone in your directory, and then you can sign in.
+      </p>
+      <div className="mt-3 flex items-center gap-2">
+        <input
+          readOnly
+          value={url}
+          aria-label="Admin approval link"
+          onFocus={(e) => e.currentTarget.select()}
+          className="h-8 min-w-0 flex-1 rounded-md border border-line bg-panel px-2 font-mono text-[11.5px]"
+        />
+        <button type="button" onClick={copy} className="flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line bg-panel px-3 hover:border-line-strong">
+          <Copy size={13} aria-hidden="true" /> {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <p className="mt-2 text-[12px] text-muted">
+        The app only asks to read Azure Resource Manager as the signed-in user. It can see only what that person could already see in the Azure portal, and it never changes anything.
+      </p>
+    </div>
+  );
+}
+
+function NotConnected({ source, status, onSignIn, signInFailed }: { source: Source; status: Status; onSignIn: () => void; signInFailed: boolean }) {
+  if (source === "cli") {
+    return (
+      <div className="grid flex-1 place-items-center p-6">
+        <div className="max-w-lg rounded-xl border border-line bg-panel p-6">
+          <h1 className="text-lg font-semibold">Connect with this computer&apos;s Azure CLI</h1>
+          {status.cliAvailable ? (
+            <>
+              <p className="mt-2 text-ink-2">This tab uses the account you signed in with in the Azure CLI. Open a terminal on this computer and run:</p>
+              <pre className="mt-3 rounded-md bg-panel-2 px-3 py-2 font-mono text-[13px]">az login</pre>
+              <p className="mt-3 text-ink-2">Then reload this page.</p>
+            </>
+          ) : (
+            <p className="mt-2 text-ink-2">
+              This connection only works when the app runs on your own computer. On a shared deployment, use the Live subscription tab and sign in with Microsoft.
+            </p>
+          )}
+          {status.error && <p className="mt-3 text-[13px] text-muted">Details: {status.error}</p>}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="grid flex-1 place-items-center p-6">
       <div className="max-w-lg rounded-xl border border-line bg-panel p-6">
@@ -516,11 +643,12 @@ function NotConnected({ status, onSignIn }: { status: Status; onSignIn: () => vo
         {msalEnabled ? (
           <>
             <p className="mt-2 text-ink-2">
-              Sign in with the Microsoft work account you use for the Azure portal. The app asks for read access to Azure Resource Manager and never changes your resources.
+              Sign in with the Microsoft account you use for the Azure portal. The app asks for read access to Azure Resource Manager and never changes your resources.
             </p>
             <button type="button" onClick={onSignIn} className="mt-4 rounded-md bg-accent px-4 py-2 text-[13px] font-medium text-accent-ink">
               Sign in with Microsoft
             </button>
+            <AdminApproval prominent={signInFailed} />
           </>
         ) : status.cliAvailable ? (
           <>
@@ -535,7 +663,7 @@ function NotConnected({ status, onSignIn }: { status: Status; onSignIn: () => vo
             Microsoft sign-in isn&apos;t configured on this deployment yet. Set <code className="font-mono">NEXT_PUBLIC_ENTRA_CLIENT_ID</code> to an Entra app registration to enable it.
           </p>
         )}
-        {status.error && <p className="mt-3 text-[13px] text-muted">Details: {status.error}</p>}
+        {status.error && !msalEnabled && <p className="mt-3 text-[13px] text-muted">Details: {status.error}</p>}
       </div>
     </div>
   );

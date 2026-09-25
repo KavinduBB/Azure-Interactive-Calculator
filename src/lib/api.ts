@@ -11,6 +11,13 @@ export function setTokenProvider(fn: (() => Promise<string | null>) | null) {
   tokenProvider = fn;
 }
 
+/** "cli" makes the server use the local Azure CLI session instead of a signed-in account. */
+let authSource: "microsoft" | "cli" = "microsoft";
+
+export function setAuthSource(source: "microsoft" | "cli") {
+  authSource = source;
+}
+
 export class ApiError extends Error {
   constructor(message: string, public status: number, public code?: string) {
     super(message);
@@ -19,7 +26,8 @@ export class ApiError extends Error {
 
 export async function api<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string>) };
-  const token = tokenProvider ? await tokenProvider() : null;
+  if (authSource === "cli") headers["x-auth-source"] = "cli";
+  const token = authSource === "microsoft" && tokenProvider ? await tokenProvider() : null;
   if (token) headers.Authorization = `Bearer ${token}`;
   let body = init?.body;
   if (init?.json !== undefined) {
